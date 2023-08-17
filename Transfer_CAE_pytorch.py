@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
-from torchvision import transforms
+from torchvision import transforms, datasets, models
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import classification_report, confusion_matrix
 import torch.nn.functional as F
@@ -45,20 +45,15 @@ class EncoderX(nn.Module):
             conv2 = self.layers[i * 4 + 2]
             
             x = conv1(x)
-            # print("after encoder conv1: ", x.shape)
             x = torch.relu(x)
             intermediate = x.clone()  # Save intermediate output for concatenation
             intermediates.append(intermediate)
             x = conv2(x)
-            # print("after encoder conv2: ", x.shape)
             x = torch.relu(x)
             x = torch.cat([intermediate, x], dim=1)
-            # print("after encoder cat: ", x.shape)
             x = nn.functional.max_pool2d(x, kernel_size=2)
-            # print("after encoder maxpooling: ", x.shape)
 
         return intermediates, x
-
 
 class DecoderX(nn.Module):
     def __init__(self, depth, num_filter):
@@ -83,18 +78,14 @@ class DecoderX(nn.Module):
             conv4 = self.layers[i * 4 + 2]
 
             x = conv3(x)
-            # print("after decoder conv3: ", x.shape)
             x = torch.relu(x)
             intermediate = x.clone()  # Save intermediate output for concatenation
             intermediate2.append(intermediate)
             x = conv4(x)
-            # print("after decoder conv4: ", x.shape)
             x = torch.relu(x)
             # intermediate = intermediates[self.depth - i - 1]
             x = torch.cat([intermediate, x], dim=1)
-            # print("after decoder cat: ", x.shape)
             x = nn.functional.interpolate(x, scale_factor=2, mode='bilinear')
-            # print("after decoder upsampling: ", x.shape)
         x = self.layers[-1](x)
 
         return x
@@ -108,9 +99,26 @@ class MyModel(nn.Module):
     def forward(self, x):
         intermediates, x = self.encoder(x)
         x = self.decoder(intermediates, x)
-        # print("Final shape: ", x.shape)
+
         return x
 
+class FineTuneModel(nn.Module):
+    def __init__(self, base_model, num_classes, dense_1, dense_2, drop):
+        super(FineTuneModel, self).__init__()
+        self.model = base_model
+        self.flatten = nn.Flatten()
+        self.dense_1 = nn.Sequential(nn.Linear(3*128*128, dense_1), nn.ReLU(), nn.Dropout(drop))
+        self.dense_2 = nn.Sequential(nn.Linear(dense_1, dense_2), nn.ReLU(), nn.Dropout(drop))
+        self.output_layer = nn.Linear(dense_2, num_classes)
+        
+    def forward(self, x):
+        x = self.model(x)
+        x = self.flatten(x)
+        x = self.dense_1(x)
+        x = self.dense_2(x)
+        x = self.output_layer(x)
+        # x = F.softmax(x, dim=1)
+        return x
 
 def select_data(radar, all_data):
 
@@ -138,68 +146,81 @@ def select_data(radar, all_data):
     X_test = torch.tensor(X_test, dtype=torch.float32).permute(0, 3, 1, 2)
     Y_train = torch.tensor(Y_train, dtype=torch.float32).permute(1, 0)
     Y_test = torch.tensor(Y_test, dtype=torch.float32).permute(1, 0)
-    print("Shape of X_train: ", X_train.size())
-    print("Shape of Y_train: ", Y_train.size())
-    print("Shape of X_test: ", X_test.size())
-    print("Shape of Y_test: ", Y_test.size())
 
     return X_train.cuda(), Y_train.cuda(), X_test.cuda(), Y_test.cuda()
 
 def convert_to_one_hot(labels, num_classes):
     labels = np.eye(num_classes)[labels.reshape(-1)]
+
     return labels
 
 def main():
-
-    depth = [5, 6]
-    num_filter = [16, 32, 64]
-    radars = [77]
+    radars = [10]
     epochs = 100
     batch_size = 16
-    lr = 0.001
-    num_class = 11
-    im_width = 128
-    im_height = 128
-    inChannel = 3
+    dense_1 = [64, 64, 128, 128, 256, 256]
+    dense_2 = [32, 64, 64, 128, 128, 256]
+    learn_rate = [0.0002, 0.0001]
     acc_hist = []
-    
+    hist_hist = []
+    drop = 0.5
+    num_class = 11
+
     # Dataset loading and preprocessing
     all_data = []
     all_data.append('../mydataset/hdf5/10GHz_dataset.hdf5')
     all_data.append('../mydataset/hdf5/24GHz_dataset.hdf5')
     all_data.append('../mydataset/hdf5/77GHz_dataset.hdf5')
 
+    model = torch.load('./weights/10GHz_5_64.pth')
+    model.to(device)
+    # print(model)
+
     for i in range(len(radars)):
         radar = radars[i]
         (X_train, Y_train, X_test, Y_test) = select_data(radar, all_data)
-        input_img = X_train.size(1)
-        for d in range(len(depth)):
-            for f in range(len(num_filter)):
-                model = MyModel(depth[d], num_filter[f])
-                print(model)
-                model.to(device)
-                loss_fn = nn.MSELoss()
-                optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-                print("Finish Building CAE")
+        dataloader = DataLoader(TensorDataset(X_train, Y_train), batch_size=batch_size, shuffle=False)
+        val_dataloader = DataLoader(TensorDataset(X_test, Y_test), batch_size=batch_size, shuffle=False)
+        Y_test2 = torch.max(Y_test, 1)
+        Y_test2 = Y_test2[1]
 
+        for k in range(len(dense_1)):
+            for m in range(len(learn_rate)):
+                train_loss, val_loss, train_cnt, val_cnt = 0, 0, 0, 0
+                model2 = FineTuneModel(model, num_class, dense_1[k], dense_2[k], drop)
+                model2.to(device)
+                optimizer = optim.Adam(model2.parameters(), lr=learn_rate[m], weight_decay=1e-06)
+                criterion = nn.CrossEntropyLoss()
                 for epoch in range(epochs):
-                    model.train()
-                    optimizer.zero_grad()
-
-                    dataloader = DataLoader(TensorDataset(X_train, X_train), batch_size=batch_size, shuffle=False)
-                    for batch_X, _ in dataloader:
-                        # print("input shape: ", batch_X.shape)
-                        outputs = model(batch_X)
-                        loss = loss_fn(outputs, batch_X)
+                    correct, total = 0, 0
+                    for inputs, labels in dataloader:
+                        model2.zero_grad()
+                        model2.train()
+                        outputs = model2(inputs)
+                        loss = criterion(outputs, labels)
+                        optimizer.zero_grad()
                         loss.backward()
                         optimizer.step()
+                        train_loss += loss.item()
+                        train_cnt += 1
 
                     with torch.no_grad():
-                        val_outputs = model(X_test)
-                        val_loss = nn.MSELoss()(val_outputs, X_test)
-                    
-                    print('Epoch ' + str(epoch + 1) + ' | ' + str(radar) + ' GHz | depth ' + str(depth[d]) + ' | Filter ' + str(num_filter[f]) + ' | Validation Loss: ' + str(val_loss.item()))
-                    torch.save(model.state_dict(), './weights/' + str(radars[i]) + 'GHz_' + str(depth[d]) + '_' + str(num_filter[f]) + '.pth')                    
+                        outputs = model2(X_test)
+                        # print("output shape: ", outputs.shape)
+                        # print("Y_test shape: ", Y_test.shape)
+                        loss = criterion(outputs, Y_test)
+                        val_loss += loss.item()
+                        val_cnt += 1
+                        _, predicted = torch.max(outputs, 1)
+                        correct = (predicted == Y_test2).sum().item()
+                        total = len(predicted)
                 
+                    print(f'Epoch {epoch+1}|{radar} GHz, batch_size={batch_size}, '
+                        f'dense_1={dense_1[k]}, dense_2={dense_2[k]}, learn_rate={learn_rate[m]}, '
+                        f'train_loss={train_loss/train_cnt:.4f}, val_loss={val_loss/val_cnt:.4f}, Accuracy={correct/total:.4f}')
+
+                    # acc_hist.append(val_loss)
+                    # hist_hist.append(train_loss) 
+
 if __name__ == "__main__":
     main()
