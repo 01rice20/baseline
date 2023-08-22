@@ -13,13 +13,57 @@ import torch.nn.functional as F
 from time import time
 from torchsummary import summary
 from torch.utils.data import DataLoader, TensorDataset
+import wandb
+from time import time
 
-torch.manual_seed(2)
-np.random.seed(1)
-random.seed(1254)
 
+wandb.init(project="baseline_pytorch")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print('Using device:', device)
+time1 = time()
+
+def set_seed():
+    torch.manual_seed(2)
+    torch.cuda.manual_seed(2)
+    torch.cuda.manual_seed_all(2)
+    np.random.seed(1)
+    random.seed(1254)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def select_data(radar, all_data):
+
+    if radar == 10:
+        data = h5py.File(all_data[0], "r")
+    elif radar == 24:
+        data = h5py.File(all_data[1], "r")
+    elif radar == 77:
+        data = h5py.File(all_data[2], "r")
+
+    X_train = np.array(data["train_img"])
+    Y_train = np.array(data["train_labels"])
+    X_test = np.array(data["test_img"])
+    Y_test = np.array(data["test_labels"])
+    print(radar, 'ghz Dataset''s Number of training samples: ', len(Y_train))
+    print(radar, 'ghz Dataset''s Number of test samples: ', len(X_test))    
+    data.close()
+
+    X_train = X_train/255.
+    X_test = X_test/255.
+    Y_train = convert_to_one_hot(Y_train, 11).T
+    Y_test = convert_to_one_hot(Y_test, 11).T
+
+    X_train = torch.tensor(X_train, dtype=torch.float32).permute(0, 3, 1, 2)
+    X_test = torch.tensor(X_test, dtype=torch.float32).permute(0, 3, 1, 2)
+    Y_train = torch.tensor(Y_train, dtype=torch.float32).permute(1, 0)
+    Y_test = torch.tensor(Y_test, dtype=torch.float32).permute(1, 0)
+
+    return X_train.cuda(), Y_train.cuda(), X_test.cuda(), Y_test.cuda()
+
+def convert_to_one_hot(labels, num_classes):
+    labels = np.eye(num_classes)[labels.reshape(-1)]
+
+    return labels
 
 class EncoderX(nn.Module):
     def __init__(self, depth, num_filter):
@@ -120,44 +164,11 @@ class FineTuneModel(nn.Module):
         # x = F.softmax(x, dim=1)
         return x
 
-def select_data(radar, all_data):
-
-    if radar == 10:
-        data = h5py.File(all_data[0], "r")
-    elif radar == 24:
-        data = h5py.File(all_data[1], "r")
-    elif radar == 77:
-        data = h5py.File(all_data[2], "r")
-
-    X_train = np.array(data["train_img"])
-    Y_train = np.array(data["train_labels"])
-    X_test = np.array(data["test_img"])
-    Y_test = np.array(data["test_labels"])
-    print(radar, 'ghz Dataset''s Number of training samples: ', len(Y_train))
-    print(radar, 'ghz Dataset''s Number of test samples: ', len(X_test))    
-    data.close()
-
-    X_train = X_train/255.
-    X_test = X_test/255.
-    Y_train = convert_to_one_hot(Y_train, 11).T
-    Y_test = convert_to_one_hot(Y_test, 11).T
-
-    X_train = torch.tensor(X_train, dtype=torch.float32).permute(0, 3, 1, 2)
-    X_test = torch.tensor(X_test, dtype=torch.float32).permute(0, 3, 1, 2)
-    Y_train = torch.tensor(Y_train, dtype=torch.float32).permute(1, 0)
-    Y_test = torch.tensor(Y_test, dtype=torch.float32).permute(1, 0)
-
-    return X_train.cuda(), Y_train.cuda(), X_test.cuda(), Y_test.cuda()
-
-def convert_to_one_hot(labels, num_classes):
-    labels = np.eye(num_classes)[labels.reshape(-1)]
-
-    return labels
-
 def main():
-    radars = [10]
+    set_seed()
+    radar = 24
     epochs = 100
-    batch_size = 16
+    batch_size = [8, 16]
     dense_1 = [64, 64, 128, 128, 256, 256]
     dense_2 = [32, 64, 64, 128, 128, 256]
     learn_rate = [0.0002, 0.0001]
@@ -168,34 +179,31 @@ def main():
 
     # Dataset loading and preprocessing
     all_data = []
-    all_data.append('../mydataset/hdf5/10GHz_dataset.hdf5')
-    all_data.append('../mydataset/hdf5/24GHz_dataset.hdf5')
-    all_data.append('../mydataset/hdf5/77GHz_dataset.hdf5')
+    all_data.append('../../dataset/hdf5/10GHz_dataset.hdf5')
+    all_data.append('../../dataset/hdf5/24GHz_dataset.hdf5')
+    all_data.append('../../dataset/hdf5/77GHz_dataset.hdf5')
+    (X_train, Y_train, X_test, Y_test) = select_data(radar, all_data)
 
-    model = torch.load('./weights/10GHz_5_64.pth')
-    model.to(device)
+    model = MyModel(5, 64)
+    model.load_state_dict(torch.load('../../weights/24GHz_5_64.pth'))
     # print(model)
     criterion = nn.CrossEntropyLoss()
-
-    for i in range(len(radars)):
-        radar = radars[i]
-        (X_train, Y_train, X_test, Y_test) = select_data(radar, all_data)
-        dataloader = DataLoader(TensorDataset(X_train, Y_train), batch_size=batch_size, shuffle=False)
-        val_dataloader = DataLoader(TensorDataset(X_test, Y_test), batch_size=batch_size, shuffle=False)
-        Y_test2 = torch.max(Y_test, 1)
-        Y_test2 = Y_test2[1]
+    
+    for i in range(len(batch_size)):
+        dataloader = DataLoader(TensorDataset(X_train, Y_train), batch_size=batch_size[i], shuffle=False)
+        val_dataloader = DataLoader(TensorDataset(X_test, Y_test), batch_size=batch_size[i], shuffle=False)
 
         for k in range(len(dense_1)):
             for m in range(len(learn_rate)):
-                train_loss, val_loss, train_cnt, val_cnt = 0, 0, 0, 0
+                train_loss, train_cnt = 0, 0
                 model2 = FineTuneModel(model, num_class, dense_1[k], dense_2[k], drop)
                 model2.to(device)
-                model2.train()
                 optimizer = optim.Adam(model2.parameters(), lr=learn_rate[m], weight_decay=1e-06)
-                for epoch in range(epochs):
-                    correct, total = 0, 0
+                
+                for epoch in range(epochs):                    
                     for inputs, labels in dataloader:
                         model2.zero_grad()
+                        model2.train()
                         outputs = model2(inputs)
                         loss = criterion(outputs, labels)
                         optimizer.zero_grad()
@@ -203,24 +211,33 @@ def main():
                         optimizer.step()
                         train_loss += loss.item()
                         train_cnt += 1
-                    model2.eval()
-                    with torch.no_grad():
-                        outputs = model2(X_test)
-                        # print("output shape: ", outputs.shape)
-                        # print("Y_test shape: ", Y_test.shape)
-                        loss = criterion(outputs, Y_test)
-                        val_loss += loss.item()
-                        val_cnt += 1
-                        _, predicted = torch.max(outputs, 1)
-                        correct = (predicted == Y_test2).sum().item()
-                        total = len(predicted)
-                
-                    print(f'Epoch {epoch+1}|{radar} GHz, batch_size={batch_size}, '
-                        f'dense_1={dense_1[k]}, dense_2={dense_2[k]}, learn_rate={learn_rate[m]}, '
-                        f'train_loss={train_loss/train_cnt:.4f}, val_loss={val_loss/val_cnt:.4f}, Accuracy={correct/total:.4f}')
+                    
+                    if((epoch + 1) % 20 == 0):
+                        val_loss, correct, total = 0, 0, 0
+                        model2.eval()
+                        for input, labels in val_dataloader:
+                            with torch.no_grad():
+                                outputs = model2(input)
+                                loss = criterion(outputs, labels)
+                                val_loss += loss.item()
+                                _, predicted = torch.max(outputs, 1)
+                                Y_test2 = torch.max(labels, 1)
+                                Y_test2 = Y_test2[1]
+                                correct += (predicted == Y_test2).sum().item()
+                                total += len(predicted)
+                    
+                        print(f'Epoch {epoch + 1}, {radar} GHz, batch_size={batch_size[i]}, '
+                            f'dense_1={dense_1[k]}, dense_2={dense_2[k]}, learn_rate={learn_rate[m]}, '
+                            f'train_loss={train_loss/train_cnt:.4f}, val_loss={val_loss/total:.4f}, Accuracy={correct/total:.4f}')
+                        wandb.log({"val_loss": val_loss/total})
+                        
+                        if((epoch + 1) == 100):
+                            print("######################################")
+                            wandb.log({"accuracy": correct/total})
 
-                    # acc_hist.append(val_loss)
-                    # hist_hist.append(train_loss) 
+                    wandb.log({"train_loss": train_loss/train_cnt})
+    time2 = time()
+    print("Total Time: ", int((time2 - time1) / 60))
 
 if __name__ == "__main__":
     main()
